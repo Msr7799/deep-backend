@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"os"
@@ -33,6 +34,21 @@ import (
 func main() {
 	// ── Load .env (ignored in production) ──
 	_ = godotenv.Load()
+
+	// ── YouTube cookies (anti-bot bypass) ──
+	// Set YT_COOKIES_B64 on Render to the base64-encoded contents of your
+	// Netscape-format cookies file exported from a logged-in browser session.
+	// Generate with: base64 -w 0 youtube_cookies.txt
+	if b64 := os.Getenv("YT_COOKIES_B64"); b64 != "" {
+		if data, err := base64.StdEncoding.DecodeString(b64); err == nil {
+			if err := os.WriteFile("/tmp/yt_cookies.txt", data, 0600); err == nil {
+				// logger not ready yet — write to stderr so it appears in Render logs
+				fmt.Fprintln(os.Stderr, "[startup] YouTube cookies written to /tmp/yt_cookies.txt")
+			}
+		} else {
+			fmt.Fprintln(os.Stderr, "[startup] WARNING: YT_COOKIES_B64 is set but failed to decode:", err)
+		}
+	}
 
 	// ── Logger ──
 	log, _ := zap.NewProduction()
