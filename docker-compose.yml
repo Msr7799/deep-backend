@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - PORT=8080
+      - STORAGE_BACKEND=local
+      - LOCAL_STORAGE_PATH=/app/tmp/storage
+      - TEMP_DIR=/app/tmp/jobs
+      - FFMPEG_PATH=ffmpeg
+      - FFPROBE_PATH=ffprobe
+      - WORKER_COUNT=4
+      - POLL_INTERVAL=2s
+      - JOB_TIMEOUT=30m
+      - MAX_RETRIES=3
+      - JWT_ENABLED=${JWT_ENABLED:-false}
+      - JWT_SECRET=${JWT_SECRET:-dev-secret-change-me}
+      - ALLOWED_ORIGINS=*
+      - ASSET_TTL=24h
+    volumes:
+      - storage_data:/app/tmp/storage
+      - jobs_data:/app/tmp/jobs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  storage_data:
+  jobs_data:

@@ -1,0 +1,451 @@
+openapi: 3.1.0
+info:
+  title: Deep Backend API
+  version: "1.0.0"
+  description: |
+    Job-based media processing backend for the Deep Android app.
+    Supports YouTube (via yt-dlp), direct media URLs, audio extraction,
+    adaptive stream merging, and transcoding via FFmpeg.
+  contact:
+    name: Deep Dev
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+  - url: https://api.yourserver.com
+    description: Production
+
+tags:
+  - name: Analysis
+    description: Submit URLs for analysis and retrieve results
+  - name: Jobs
+    description: Poll job status and progress
+  - name: Actions
+    description: Trigger processing actions on analyzed media
+  - name: Assets
+    description: Retrieve and download processed output files
+  - name: Health
+    description: Service health and readiness probes
+
+paths:
+
+  # ── Health ─────────────────────────────────────────────────────────────────
+
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      operationId: healthz
+      responses:
+        "200":
+          description: Service is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+
+  /readyz:
+    get:
+      tags: [Health]
+      summary: Readiness probe
+      operationId: readyz
+      responses:
+        "200":
+          description: Service is ready to accept traffic
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+
+  # ── Analysis ───────────────────────────────────────────────────────────────
+
+  /v1/analyze:
+    post:
+      tags: [Analysis]
+      summary: Submit a source URL for analysis
+      description: |
+        Creates an async analyze job and returns immediately.
+        Poll `/v1/jobs/{id}` to track progress.
+        Supports YouTube URLs (via yt-dlp) and direct media URLs.
+      operationId: analyze
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AnalyzeRequest"
+            examples:
+              youtube:
+                summary: YouTube video
+                value: { source_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ" }
+              direct:
+                summary: Direct MP4
+                value: { source_url: "https://example.com/video.mp4" }
+      responses:
+        "202":
+          description: Analyze job created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "429":
+          description: Rate limit exceeded (20 req/min per IP)
+
+  # ── Jobs ───────────────────────────────────────────────────────────────────
+
+  /v1/jobs/{id}:
+    get:
+      tags: [Jobs]
+      summary: Get job status and optional asset
+      operationId: getJob
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/jobId"
+      responses:
+        "200":
+          description: Job status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobDetailResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/jobs/{id}/variants:
+    get:
+      tags: [Jobs]
+      summary: List available media variants from a completed analyze job
+      operationId: getVariants
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/jobId"
+      responses:
+        "200":
+          description: Available variants
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VariantsResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ── Actions ────────────────────────────────────────────────────────────────
+
+  /v1/jobs/{id}/actions/extract-audio:
+    post:
+      tags: [Actions]
+      summary: Extract audio from a variant
+      description: |
+        Creates a new processing job that extracts a real AAC audio track
+        from the selected variant using FFmpeg (not just a file rename).
+      operationId: extractAudio
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/jobId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ActionRequest"
+      responses:
+        "202":
+          description: Processing job created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/jobs/{id}/actions/merge:
+    post:
+      tags: [Actions]
+      summary: Merge video-only and audio-only adaptive streams
+      description: |
+        Combines a video-only adaptive stream with a separate audio-only
+        stream into a single MP4 using FFmpeg stream copy (fast, lossless).
+      operationId: merge
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/jobId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MergeRequest"
+      responses:
+        "202":
+          description: Merge job created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /v1/jobs/{id}/actions/transcode:
+    post:
+      tags: [Actions]
+      summary: Transcode to H.264+AAC MP4
+      operationId: transcode
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/jobId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ActionRequest"
+      responses:
+        "202":
+          description: Transcode job created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  # ── Assets ─────────────────────────────────────────────────────────────────
+
+  /v1/assets/{id}:
+    get:
+      tags: [Assets]
+      summary: Get asset metadata + signed download URL
+      operationId: getAsset
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Asset metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssetResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/assets/dl/{token}:
+    get:
+      tags: [Assets]
+      summary: Download asset by one-time token (no auth required)
+      operationId: downloadByToken
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Binary file download
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+# ── Components ─────────────────────────────────────────────────────────────
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    jobId:
+      name: id
+      in: path
+      required: true
+      description: Job UUID
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  schemas:
+
+    StatusResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+    AnalyzeRequest:
+      type: object
+      required: [source_url]
+      properties:
+        source_url:
+          type: string
+          format: uri
+          description: The URL to analyze (YouTube, direct media, etc.)
+
+    ActionRequest:
+      type: object
+      required: [variant_id]
+      properties:
+        variant_id:
+          type: string
+          format: uuid
+        options:
+          type: object
+          additionalProperties: true
+
+    MergeRequest:
+      type: object
+      required: [video_variant_id, audio_variant_id]
+      properties:
+        video_variant_id:
+          type: string
+          format: uuid
+        audio_variant_id:
+          type: string
+          format: uuid
+
+    JobStatus:
+      type: string
+      enum: [queued, analyzing, processing, completed, failed]
+
+    JobResponse:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          $ref: "#/components/schemas/JobStatus"
+        progress_percent:
+          type: integer
+          minimum: 0
+          maximum: 100
+        progress_stage:
+          type: string
+        error_message:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    JobDetailResponse:
+      type: object
+      properties:
+        job:
+          $ref: "#/components/schemas/JobResponse"
+        asset:
+          $ref: "#/components/schemas/AssetResponse"
+
+    VariantResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        label:
+          type: string
+        container:
+          type: string
+        codec_video:
+          type: string
+        codec_audio:
+          type: string
+        bitrate:
+          type: integer
+          format: int64
+        width:
+          type: integer
+        height:
+          type: integer
+        duration_ms:
+          type: integer
+          format: int64
+        is_audio_only:
+          type: boolean
+        is_video_only:
+          type: boolean
+        is_adaptive:
+          type: boolean
+        mime_type:
+          type: string
+
+    VariantsResponse:
+      type: object
+      properties:
+        variants:
+          type: array
+          items:
+            $ref: "#/components/schemas/VariantResponse"
+
+    AssetResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        filename:
+          type: string
+        mime_type:
+          type: string
+        size_bytes:
+          type: integer
+          format: int64
+        download_url:
+          type: string
+          format: uri
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
