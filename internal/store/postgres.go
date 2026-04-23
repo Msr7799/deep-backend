@@ -46,6 +46,19 @@ func NewPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
+func toJSONB(v any) string {
+	if v == nil {
+		return "{}"
+	}
+
+	b, err := json.Marshal(v)
+	if err != nil || len(b) == 0 || string(b) == "null" {
+		return "{}"
+	}
+
+	return string(b)
+}
+
 // ─────────────────────────────────────────────
 //  SourceRequestStore
 // ─────────────────────────────────────────────
@@ -99,12 +112,13 @@ func (s *pgMediaJobStore) Create(ctx context.Context, job *domain.MediaJob) erro
 	job.UpdatedAt = now
 	job.Status = domain.JobStatusQueued
 
-	meta, _ := json.Marshal(job.Metadata)
+	meta := toJSONB(job.Metadata)
+
 	_, err := s.db.Exec(ctx,
 		`INSERT INTO media_jobs
          (id, user_id, source_request_id, job_type, status,
           progress_percent, progress_stage, metadata, retry_count, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11)`,
 		job.ID, job.UserID, job.SourceRequestID, job.JobType, job.Status,
 		0, "", meta, 0, job.CreatedAt, job.UpdatedAt,
 	)
@@ -188,7 +202,7 @@ func (s *pgMediaJobStore) Dequeue(ctx context.Context) (*domain.MediaJob, error)
 		&job.CreatedAt, &job.UpdatedAt,
 	)
 	if err == pgx.ErrNoRows {
-		return nil, nil // nothing to do
+		return nil, nil
 	}
 	if err != nil {
 		return nil, err
@@ -269,13 +283,15 @@ func (s *pgMediaVariantStore) BulkCreate(ctx context.Context, variants []*domain
 		if v.ID == uuid.Nil {
 			v.ID = uuid.New()
 		}
-		meta, _ := json.Marshal(v.Metadata)
+
+		meta := toJSONB(v.Metadata)
+
 		_, err := tx.Exec(ctx,
 			`INSERT INTO media_variants
              (id, media_job_id, label, container, codec_video, codec_audio,
               bitrate, width, height, duration_ms,
               is_audio_only, is_video_only, is_adaptive, source_url, mime_type, metadata)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb)`,
 			v.ID, v.MediaJobID, v.Label, v.Container, v.CodecVideo, v.CodecAudio,
 			v.Bitrate, v.Width, v.Height, v.DurationMs,
 			v.IsAudioOnly, v.IsVideoOnly, v.IsAdaptive, v.SourceURL, v.MimeType, meta,
@@ -436,10 +452,12 @@ func (s *pgJobEventStore) Append(ctx context.Context, event *domain.JobEvent) er
 		event.ID = uuid.New()
 	}
 	event.CreatedAt = time.Now().UTC()
-	payload, _ := json.Marshal(event.Payload)
+
+	payload := toJSONB(event.Payload)
+
 	_, err := s.db.Exec(ctx,
 		`INSERT INTO job_events (id, job_id, event_type, message, payload, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6)`,
+         VALUES ($1,$2,$3,$4,$5::jsonb,$6)`,
 		event.ID, event.JobID, event.EventType, event.Message, payload, event.CreatedAt,
 	)
 	return err
