@@ -13,7 +13,7 @@ func newExecCmd(ctx context.Context, bin string, args ...string) *exec.Cmd {
 	return exec.CommandContext(ctx, bin, args...)
 }
 
-// ytDlpInfo matches the yt-dlp --dump-json schema (partial).
+// ytDlpInfo matches a subset of the yt-dlp --dump-single-json schema.
 type ytDlpInfo struct {
 	Title    string        `json:"title"`
 	Duration float64       `json:"duration"`
@@ -46,41 +46,47 @@ func parseYtDlpJSON(raw []byte) ([]ytFormat, string, error) {
 
 	durationMs := int64(info.Duration * 1000)
 	seen := map[string]bool{}
-	var formats []ytFormat
+	formats := make([]ytFormat, 0, len(info.Formats))
 
 	for _, f := range info.Formats {
-		if f.URL == "" {
+		if strings.TrimSpace(f.URL) == "" {
 			continue
 		}
-		// Deduplicate by resolution+codec combo
-		key := fmt.Sprintf("%s|%s|%s", f.Resolution, f.VCodec, f.ACodec)
+
+		vCodec := normalizeCodec(f.VCodec)
+		aCodec := normalizeCodec(f.ACodec)
+		isAudio := vCodec == ""
+		isVideo := aCodec == ""
+		if isAudio && isVideo {
+			continue
+		}
+		if f.Ext == "mhtml" {
+			continue
+		}
+
+		key := fmt.Sprintf("%s|%s|%s|%s|%d|%d", f.FormatID, f.Ext, vCodec, aCodec, f.Width, f.Height)
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
 
-		isAudio := f.VCodec == "none" || f.VCodec == ""
-		isVideo := f.ACodec == "none" || f.ACodec == ""
-		isAdaptive := isAudio || isVideo
-
-		label := buildLabel(f)
-		tbr := int64(f.TBR * 1000)
-
-		container := f.Ext
-		mimeType := mimeFromContainer(container, isAudio, isVideo)
+		container := strings.TrimSpace(strings.ToLower(f.Ext))
+		if container == "" {
+			container = "mp4"
+		}
 
 		formats = append(formats, ytFormat{
-			Label:      label,
+			Label:      buildLabel(f),
 			Container:  container,
-			VCodec:     f.VCodec,
-			ACodec:     f.ACodec,
-			TBR:        tbr,
+			VCodec:     vCodec,
+			ACodec:     aCodec,
+			TBR:        int64(f.TBR * 1000),
 			Width:      f.Width,
 			Height:     f.Height,
 			DurationMs: durationMs,
-			IsAdaptive: isAdaptive,
+			IsAdaptive: isAudio || isVideo,
 			URL:        f.URL,
-			MimeType:   mimeType,
+			MimeType:   mimeFromContainer(container, isAudio, isVideo),
 		})
 	}
 
@@ -88,23 +94,34 @@ func parseYtDlpJSON(raw []byte) ([]ytFormat, string, error) {
 }
 
 func buildLabel(f ytDlpFormat) string {
+	vCodec := normalizeCodec(f.VCodec)
+	aCodec := normalizeCodec(f.ACodec)
+
 	if f.Height > 0 {
 		label := fmt.Sprintf("%dp", f.Height)
 		if f.FPS >= 50 {
-			label += fmt.Sprintf("%.0ffps", f.FPS)
+			label += fmt.Sprintf(" %.0ffps", f.FPS)
+		}
+		if aCodec == "" {
+			label += " video-only"
 		}
 		return label
 	}
-	if f.FormatNote != "" {
-		return f.FormatNote
-	}
-	if f.VCodec == "none" || f.VCodec == "" {
-		// Audio only
-		codec := strings.Split(f.ACodec, ".")[0]
+	if vCodec == "" {
+		codec := aCodec
+		if codec == "" {
+			codec = strings.TrimSpace(strings.ToLower(f.Ext))
+		}
 		if f.ABR > 0 {
 			return fmt.Sprintf("Audio %s %.0fkbps", codec, f.ABR)
 		}
 		return fmt.Sprintf("Audio %s", codec)
 	}
-	return strings.ToUpper(f.Ext)
+	if f.FormatNote != "" {
+		return f.FormatNote
+	}
+	if f.Resolution != "" && f.Resolution != "audio only" {
+		return f.Resolution
+	}
+	return strings.ToUpper(strings.TrimSpace(f.Ext))
 }

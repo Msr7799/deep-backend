@@ -17,12 +17,10 @@ type Processor struct {
 	tempDir    string
 }
 
-// NewProcessor creates a Processor.
 func NewProcessor(ffmpegPath, tempDir string) *Processor {
 	return &Processor{ffmpegPath: ffmpegPath, tempDir: tempDir}
 }
 
-// ExtractAudioResult contains the result of an audio extraction.
 type ExtractAudioResult struct {
 	FilePath string
 	MimeType string
@@ -30,23 +28,22 @@ type ExtractAudioResult struct {
 	Codec    string
 }
 
-// ExtractAudio downloads the source URL and extracts an AAC audio track.
-// No shell-string interpolation: all args are passed as a []string.
-// Stderr is captured and returned on error for debugging.
+// ExtractAudio extracts AAC audio from a direct media URL or local file.
+// For YouTube page URLs, callers should analyze with yt-dlp first and pass the selected format URL.
 func (p *Processor) ExtractAudio(ctx context.Context, sourceURL, jobID string, progressCb func(int)) (*ExtractAudioResult, error) {
 	if err := os.MkdirAll(p.tempDir, 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir temp: %w", err)
 	}
 
 	outPath := filepath.Join(p.tempDir, SafeFilename(jobID+".m4a"))
-
 	args := []string{
-		"-y",                  // overwrite without asking
+		"-y",
+		"-nostdin",
 		"-loglevel", "error",
 		"-user_agent", "Mozilla/5.0 (Linux; Android 14; Pixel 9) AppleWebKit/537.36",
-		"-i", sourceURL,       // input: URL passed as arg, never concatenated into shell string
-		"-vn",                 // strip video
-		"-acodec", "aac",     // encode to AAC
+		"-i", sourceURL,
+		"-vn",
+		"-acodec", "aac",
 		"-b:a", "192k",
 		"-movflags", "+faststart",
 		outPath,
@@ -57,7 +54,10 @@ func (p *Processor) ExtractAudio(ctx context.Context, sourceURL, jobID string, p
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("ffmpeg extract audio: %w\nstderr: %s", err, stderr.String())
+		return nil, fmt.Errorf("ffmpeg extract audio: %w\nstderr: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	if progressCb != nil {
+		progressCb(100)
 	}
 
 	return &ExtractAudioResult{
@@ -68,7 +68,6 @@ func (p *Processor) ExtractAudio(ctx context.Context, sourceURL, jobID string, p
 	}, nil
 }
 
-// MergeAVResult is the result of merging a video-only + audio-only adaptive stream.
 type MergeAVResult struct {
 	FilePath string
 	MimeType string
@@ -83,9 +82,9 @@ func (p *Processor) MergeAV(ctx context.Context, videoURL, audioURL, jobID strin
 
 	outPath := filepath.Join(p.tempDir, SafeFilename(jobID+"_merged.mp4"))
 	ua := "Mozilla/5.0 (Linux; Android 14; Pixel 9) AppleWebKit/537.36"
-
 	args := []string{
 		"-y",
+		"-nostdin",
 		"-loglevel", "error",
 		"-user_agent", ua,
 		"-i", videoURL,
@@ -104,7 +103,7 @@ func (p *Processor) MergeAV(ctx context.Context, videoURL, audioURL, jobID strin
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("ffmpeg merge: %w\nstderr: %s", err, stderr.String())
+		return nil, fmt.Errorf("ffmpeg merge: %w\nstderr: %s", err, strings.TrimSpace(stderr.String()))
 	}
 
 	return &MergeAVResult{
@@ -114,23 +113,22 @@ func (p *Processor) MergeAV(ctx context.Context, videoURL, audioURL, jobID strin
 	}, nil
 }
 
-// TranscodeResult is the result of a generic transcode.
 type TranscodeResult struct {
 	FilePath string
 	MimeType string
 	Filename string
 }
 
-// Transcode re-encodes the source into an MP4 with H.264+AAC.
+// Transcode re-encodes a direct media URL or local file into MP4 (H.264 + AAC).
 func (p *Processor) Transcode(ctx context.Context, sourceURL, jobID string) (*TranscodeResult, error) {
 	if err := os.MkdirAll(p.tempDir, 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir temp: %w", err)
 	}
 
 	outPath := filepath.Join(p.tempDir, SafeFilename(jobID+"_tc.mp4"))
-
 	args := []string{
 		"-y",
+		"-nostdin",
 		"-loglevel", "error",
 		"-user_agent", "Mozilla/5.0 (Linux; Android 14; Pixel 9) AppleWebKit/537.36",
 		"-i", sourceURL,
@@ -148,7 +146,7 @@ func (p *Processor) Transcode(ctx context.Context, sourceURL, jobID string) (*Tr
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("ffmpeg transcode: %w\nstderr: %s", err, stderr.String())
+		return nil, fmt.Errorf("ffmpeg transcode: %w\nstderr: %s", err, strings.TrimSpace(stderr.String()))
 	}
 
 	return &TranscodeResult{
@@ -158,7 +156,6 @@ func (p *Processor) Transcode(ctx context.Context, sourceURL, jobID string) (*Tr
 	}, nil
 }
 
-// OpenFile returns an io.ReadCloser for a local file path.
 func OpenFile(path string) (io.ReadCloser, int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -172,12 +169,10 @@ func OpenFile(path string) (io.ReadCloser, int64, error) {
 	return f, info.Size(), nil
 }
 
-// Cleanup removes a local temp file silently.
 func Cleanup(path string) {
 	_ = os.Remove(path)
 }
 
-// SafeFilename removes characters that could be dangerous in filenames.
 func SafeFilename(name string) string {
 	replacer := strings.NewReplacer(
 		"/", "_",

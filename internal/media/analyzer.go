@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -13,8 +14,7 @@ import (
 )
 
 // Analyzer analyses a source URL and produces a list of MediaVariants.
-// It supports: direct media files, YouTube (via ytdlp hint detection),
-// and generic video/audio streams detected by ffprobe.
+// It supports direct media files and YouTube links via yt-dlp.
 type Analyzer struct {
 	prober *Prober
 }
@@ -39,10 +39,7 @@ func (a *Analyzer) Analyze(ctx context.Context, jobID uuid.UUID, sourceURL strin
 	}
 }
 
-// ─────────────────────────────────────────────
-//  Direct media analysis
-// ─────────────────────────────────────────────
-
+// analyzeDirect probes a direct media URL or local file using ffprobe.
 func (a *Analyzer) analyzeDirect(ctx context.Context, jobID uuid.UUID, sourceURL string) (*AnalyzeResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
@@ -60,8 +57,8 @@ func (a *Analyzer) analyzeDirect(ctx context.Context, jobID uuid.UUID, sourceURL
 
 	var variants []*domain.MediaVariant
 
-	if vs != nil && as != nil {
-		// Combined stream
+	switch {
+	case vs != nil && as != nil:
 		variants = append(variants, &domain.MediaVariant{
 			ID:          uuid.New(),
 			MediaJobID:  jobID,
@@ -79,7 +76,7 @@ func (a *Analyzer) analyzeDirect(ctx context.Context, jobID uuid.UUID, sourceURL
 			SourceURL:   sourceURL,
 			MimeType:    mimeFromContainer(container, false, false),
 		})
-	} else if vs != nil {
+	case vs != nil:
 		variants = append(variants, &domain.MediaVariant{
 			ID:          uuid.New(),
 			MediaJobID:  jobID,
@@ -90,11 +87,13 @@ func (a *Analyzer) analyzeDirect(ctx context.Context, jobID uuid.UUID, sourceURL
 			Width:       vs.Width,
 			Height:      vs.Height,
 			DurationMs:  dms,
+			IsAudioOnly: false,
 			IsVideoOnly: true,
+			IsAdaptive:  true,
 			SourceURL:   sourceURL,
 			MimeType:    mimeFromContainer(container, false, true),
 		})
-	} else if as != nil {
+	case as != nil:
 		variants = append(variants, &domain.MediaVariant{
 			ID:          uuid.New(),
 			MediaJobID:  jobID,
@@ -104,60 +103,64 @@ func (a *Analyzer) analyzeDirect(ctx context.Context, jobID uuid.UUID, sourceURL
 			Bitrate:     br,
 			DurationMs:  dms,
 			IsAudioOnly: true,
+			IsVideoOnly: false,
+			IsAdaptive:  true,
 			SourceURL:   sourceURL,
 			MimeType:    mimeFromContainer(container, true, false),
 		})
+	}
+
+	if len(variants) == 0 {
+		return nil, fmt.Errorf("probe %s: no playable streams detected", sourceURL)
 	}
 
 	title := pr.Format.Tags["title"]
 	return &AnalyzeResult{Variants: variants, Title: title}, nil
 }
 
-// ─────────────────────────────────────────────
-//  YouTube analysis (yt-dlp integration)
-// ─────────────────────────────────────────────
-
 // analyzeYouTube uses yt-dlp to enumerate available formats.
-// yt-dlp must be installed on the host or in the container.
-// No shell interpolation: we pass args directly.
+// Important: we do NOT fall back to ffprobe for YouTube page URLs because ffprobe
+// cannot probe a normal YouTube watch/share URL directly.
 func (a *Analyzer) analyzeYouTube(ctx context.Context, jobID uuid.UUID, sourceURL string) (*AnalyzeResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 
 	formats, title, err := ytDlpListFormats(ctx, sourceURL)
 	if err != nil {
-		// Fallback: try direct probe (works for some YouTube embed URLs)
-		return a.analyzeDirect(ctx, jobID, sourceURL)
+		return nil, fmt.Errorf("youtube analyze via yt-dlp failed: %w", err)
+	}
+	if len(formats) == 0 {
+		return nil, fmt.Errorf("youtube analyze via yt-dlp returned no formats")
 	}
 
-	var variants []*domain.MediaVariant
+	variants := make([]*domain.MediaVariant, 0, len(formats))
 	for _, f := range formats {
-		v := &domain.MediaVariant{
-			ID:         uuid.New(),
-			MediaJobID: jobID,
-			Label:      f.Label,
-			Container:  f.Container,
-			CodecVideo: f.VCodec,
-			CodecAudio: f.ACodec,
-			Bitrate:    f.TBR,
-			Width:      f.Width,
-			Height:     f.Height,
-			DurationMs: f.DurationMs,
-			IsAudioOnly: f.VCodec == "" || f.VCodec == "none",
-			IsVideoOnly: f.ACodec == "" || f.ACodec == "none",
+		vCodec := normalizeCodec(f.VCodec)
+		aCodec := normalizeCodec(f.ACodec)
+		isAudioOnly := vCodec == ""
+		isVideoOnly := aCodec == ""
+
+		variants = append(variants, &domain.MediaVariant{
+			ID:          uuid.New(),
+			MediaJobID:  jobID,
+			Label:       f.Label,
+			Container:   f.Container,
+			CodecVideo:  vCodec,
+			CodecAudio:  aCodec,
+			Bitrate:     f.TBR,
+			Width:       f.Width,
+			Height:      f.Height,
+			DurationMs:  f.DurationMs,
+			IsAudioOnly: isAudioOnly,
+			IsVideoOnly: isVideoOnly,
 			IsAdaptive:  f.IsAdaptive,
 			SourceURL:   f.URL,
 			MimeType:    f.MimeType,
-		}
-		variants = append(variants, v)
+		})
 	}
 
 	return &AnalyzeResult{Variants: variants, Title: title}, nil
 }
-
-// ─────────────────────────────────────────────
-//  yt-dlp helpers
-// ─────────────────────────────────────────────
 
 type ytFormat struct {
 	Label      string
@@ -174,31 +177,39 @@ type ytFormat struct {
 }
 
 // ytDlpListFormats calls yt-dlp to enumerate formats.
-// It uses the JSON output format for reliable parsing.
+// It uses JSON output for reliable parsing and captures stderr for diagnostics.
 func ytDlpListFormats(ctx context.Context, sourceURL string) ([]ytFormat, string, error) {
 	cmd := newExecCmd(ctx, "yt-dlp",
-		"--dump-json",
+		"--dump-single-json",
 		"--no-warnings",
 		"--no-playlist",
+		"--extractor-args", "youtube:player_client=android,web",
 		"--user-agent", "Mozilla/5.0 (Linux; Android 14; Pixel 9) AppleWebKit/537.36",
 		sourceURL,
 	)
-	out, err := cmd.Output()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, "", fmt.Errorf("yt-dlp: %w", err)
+		return nil, "", fmt.Errorf("yt-dlp failed: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return parseYtDlpJSON(out)
 }
 
-// ─────────────────────────────────────────────
-//  URL classification helpers
-// ─────────────────────────────────────────────
+func isYouTubeURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Host)
+	path := strings.ToLower(u.Path)
+	return strings.Contains(host, "youtube.com") || strings.Contains(host, "youtu.be") || strings.Contains(path, "/shorts/")
+}
 
-func isYouTubeURL(u string) bool {
-	low := strings.ToLower(u)
-	return strings.Contains(low, "youtube.com/watch") ||
-		strings.Contains(low, "youtu.be/") ||
-		strings.Contains(low, "youtube.com/shorts/")
+func normalizeCodec(v string) string {
+	v = strings.TrimSpace(strings.ToLower(v))
+	if v == "" || v == "none" {
+		return ""
+	}
+	return v
 }
 
 func labelFromStream(vs *StreamInfo, pr *ProbeResult) string {
@@ -221,6 +232,8 @@ func mimeFromContainer(container string, audioOnly, videoOnly bool) string {
 			return "audio/ogg"
 		case "wav":
 			return "audio/wav"
+		case "webm":
+			return "audio/webm"
 		default:
 			return "audio/mp4"
 		}
@@ -244,7 +257,7 @@ func ValidateSourceURL(ctx context.Context, rawURL string) error {
 		return fmt.Errorf("url must start with http:// or https://")
 	}
 	if isYouTubeURL(rawURL) {
-		return nil // skip HEAD check for YouTube
+		return nil // skip HEAD check for YouTube page URLs
 	}
 
 	client := &http.Client{Timeout: 10 * time.Second}

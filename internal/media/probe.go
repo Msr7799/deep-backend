@@ -25,16 +25,16 @@ type FormatInfo struct {
 }
 
 type StreamInfo struct {
-	Index          int               `json:"index"`
-	CodecName      string            `json:"codec_name"`
-	CodecType      string            `json:"codec_type"` // "video" | "audio"
-	Width          int               `json:"width"`
-	Height         int               `json:"height"`
-	BitRate        string            `json:"bit_rate"`
-	SampleRate     string            `json:"sample_rate"`
-	Channels       int               `json:"channels"`
-	DurationTS     int64             `json:"duration_ts"`
-	Tags           map[string]string `json:"tags"`
+	Index      int               `json:"index"`
+	CodecName  string            `json:"codec_name"`
+	CodecType  string            `json:"codec_type"`
+	Width      int               `json:"width"`
+	Height     int               `json:"height"`
+	BitRate    string            `json:"bit_rate"`
+	SampleRate string            `json:"sample_rate"`
+	Channels   int               `json:"channels"`
+	DurationTS int64             `json:"duration_ts"`
+	Tags       map[string]string `json:"tags"`
 }
 
 // Prober wraps ffprobe to extract media metadata.
@@ -47,10 +47,10 @@ func NewProber(ffprobePath string) *Prober {
 }
 
 // Probe runs ffprobe against a URL or local path and returns structured results.
-// No shell interpolation: arguments are passed as a slice.
+// For YouTube page URLs, callers should use yt-dlp first instead of ffprobe.
 func (p *Prober) Probe(ctx context.Context, input string) (*ProbeResult, error) {
 	args := []string{
-		"-v", "quiet",
+		"-v", "error",
 		"-print_format", "json",
 		"-show_format",
 		"-show_streams",
@@ -59,14 +59,12 @@ func (p *Prober) Probe(ctx context.Context, input string) (*ProbeResult, error) 
 	}
 
 	cmd := exec.CommandContext(ctx, p.ffprobePath, args...)
-	out, err := cmd.Output()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		var exitErr *exec.ExitError
-		if ok := err.(*exec.ExitError); ok != nil {
-			exitErr = ok
-			return nil, fmt.Errorf("ffprobe exit %d: %s", exitErr.ExitCode(), string(exitErr.Stderr))
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("ffprobe exit %d: %s", exitErr.ExitCode(), strings.TrimSpace(string(out)))
 		}
-		return nil, fmt.Errorf("ffprobe: %w", err)
+		return nil, fmt.Errorf("ffprobe: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 
 	var result ProbeResult
@@ -76,7 +74,6 @@ func (p *Prober) Probe(ctx context.Context, input string) (*ProbeResult, error) 
 	return &result, nil
 }
 
-// DurationMs extracts duration in milliseconds from a ProbeResult.
 func DurationMs(pr *ProbeResult) int64 {
 	if pr == nil {
 		return 0
@@ -87,7 +84,6 @@ func DurationMs(pr *ProbeResult) int64 {
 	return 0
 }
 
-// BitRate extracts the overall bitrate as int64.
 func BitRate(pr *ProbeResult) int64 {
 	if pr == nil {
 		return 0
@@ -98,7 +94,6 @@ func BitRate(pr *ProbeResult) int64 {
 	return 0
 }
 
-// VideoStream returns the first video stream or nil.
 func VideoStream(pr *ProbeResult) *StreamInfo {
 	for i := range pr.Streams {
 		if pr.Streams[i].CodecType == "video" {
@@ -108,7 +103,6 @@ func VideoStream(pr *ProbeResult) *StreamInfo {
 	return nil
 }
 
-// AudioStream returns the first audio stream or nil.
 func AudioStream(pr *ProbeResult) *StreamInfo {
 	for i := range pr.Streams {
 		if pr.Streams[i].CodecType == "audio" {
@@ -118,7 +112,6 @@ func AudioStream(pr *ProbeResult) *StreamInfo {
 	return nil
 }
 
-// ContainerFromFormat returns a clean container label from format_name.
 func ContainerFromFormat(fmtName string) string {
 	parts := strings.Split(fmtName, ",")
 	if len(parts) > 0 {
