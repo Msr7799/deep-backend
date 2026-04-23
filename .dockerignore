@@ -1,0 +1,39 @@
+# Git
+.git
+.gitignore
+.github
+
+# Env files (injected at runtime via --env-file or secrets)
+.env
+.env.*
+!.env.example
+
+# Local binaries & temp dirs
+tmp/
+*.exe
+*.test
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Go build cache
+vendor/
+
+# Documentation (not needed in image)
+README.md
+docs/
+*.md
+
+# Agents / Skills metadata
+.agents/
+skills-lock.json
+
+# Test files
+*_test.go
+testdata/
+
+# CI
+.github/
