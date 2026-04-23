@@ -177,12 +177,12 @@ type ytFormat struct {
 	MimeType   string
 }
 
-// ytCookiesPath is where startup writes the YouTube cookies decoded from YT_COOKIES_B64.
+// ytCookiesPath is where startup writes the YouTube cookies decoded from YT_COOKIES_GZ_B64.
 const ytCookiesPath = "/tmp/yt_cookies.txt"
 
 // ytDlpListFormats calls yt-dlp to enumerate formats.
 // It uses JSON output for reliable parsing and captures stderr for diagnostics.
-// If /tmp/yt_cookies.txt exists (written at startup from YT_COOKIES_B64), it is
+// If /tmp/yt_cookies.txt exists (written at startup from YT_COOKIES_GZ_B64), it is
 // passed to yt-dlp so YouTube treats the request as an authenticated browser session.
 func ytDlpListFormats(ctx context.Context, sourceURL string) ([]ytFormat, string, error) {
 	args := []string{
@@ -193,9 +193,11 @@ func ytDlpListFormats(ctx context.Context, sourceURL string) ([]ytFormat, string
 		"--user-agent", "Mozilla/5.0 (Linux; Android 14; Pixel 9) AppleWebKit/537.36",
 	}
 
-	// Inject cookies file if it was written at startup from YT_COOKIES_B64.
 	if _, err := os.Stat(ytCookiesPath); err == nil {
+		fmt.Fprintf(os.Stderr, "[yt-dlp] using cookies file: %s\n", ytCookiesPath)
 		args = append(args, "--cookies", ytCookiesPath)
+	} else {
+		fmt.Fprintf(os.Stderr, "[yt-dlp] cookies file not found: %v\n", err)
 	}
 
 	args = append(args, sourceURL)

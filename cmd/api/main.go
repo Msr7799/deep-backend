@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -32,35 +35,41 @@ import (
 )
 
 func main() {
-	// ── Load .env (ignored in production) ──
 	_ = godotenv.Load()
 
-	// ── YouTube cookies (anti-bot bypass) ──
-	// Set YT_COOKIES_B64 on Render to the base64-encoded contents of your
-	// Netscape-format cookies file exported from a logged-in browser session.
-	// Generate with: base64 -w 0 youtube_cookies.txt
-	if b64 := os.Getenv("YT_COOKIES_B64"); b64 != "" {
-		if data, err := base64.StdEncoding.DecodeString(b64); err == nil {
-			if err := os.WriteFile("/tmp/yt_cookies.txt", data, 0600); err == nil {
-				// logger not ready yet — write to stderr so it appears in Render logs
-				fmt.Fprintln(os.Stderr, "[startup] YouTube cookies written to /tmp/yt_cookies.txt")
-			}
+	// YouTube cookies from gzipped+base64 env var to avoid huge env payloads.
+	if b64 := os.Getenv("YT_COOKIES_GZ_B64"); b64 != "" {
+		raw, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "[startup] WARNING: YT_COOKIES_GZ_B64 is set but failed to decode:", err)
 		} else {
-			fmt.Fprintln(os.Stderr, "[startup] WARNING: YT_COOKIES_B64 is set but failed to decode:", err)
+			gr, err := gzip.NewReader(bytes.NewReader(raw))
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "[startup] WARNING: failed to open gzip cookies payload:", err)
+			} else {
+				data, err := io.ReadAll(gr)
+				_ = gr.Close()
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "[startup] WARNING: failed to gunzip YouTube cookies:", err)
+				} else if err := os.WriteFile("/tmp/yt_cookies.txt", data, 0o600); err != nil {
+					fmt.Fprintln(os.Stderr, "[startup] WARNING: failed to write YouTube cookies file:", err)
+				} else {
+					fmt.Fprintf(os.Stderr, "[startup] YouTube cookies written to /tmp/yt_cookies.txt (%d bytes)\n", len(data))
+				}
+			}
 		}
+	} else {
+		fmt.Fprintln(os.Stderr, "[startup] YT_COOKIES_GZ_B64 not set")
 	}
 
-	// ── Logger ──
 	log, _ := zap.NewProduction()
 	defer log.Sync() //nolint:errcheck
 
-	// ── Config ──
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatal("config load failed", zap.Error(err))
 	}
 
-	// ── Database ──
 	ctx := context.Background()
 	pool, err := store.NewPool(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -69,20 +78,17 @@ func main() {
 	defer pool.Close()
 	log.Info("database connected")
 
-	// ── Migrations ──
 	if err := runMigrations(cfg.DatabaseURL); err != nil {
 		log.Fatal("migrations failed", zap.Error(err))
 	}
 	log.Info("migrations applied")
 
-	// ── Stores ──
 	jobStore := store.NewMediaJobStore(pool)
 	variantStore := store.NewMediaVariantStore(pool)
 	assetStore := store.NewOutputAssetStore(pool)
 	eventStore := store.NewJobEventStore(pool)
 	sourceStore := store.NewSourceRequestStore(pool)
 
-	// ── Storage backend ──
 	var storageBackend storage.Backend
 	switch cfg.StorageBackend {
 	case "s3":
@@ -100,40 +106,25 @@ func main() {
 		if err != nil {
 			log.Fatal("s3 storage init failed", zap.Error(err))
 		}
-		log.Info("storage: cloudflare R2 / S3",
-			zap.String("bucket", cfg.S3Bucket),
-			zap.String("endpoint", cfg.S3Endpoint),
-		)
+		log.Info("storage: cloudflare R2 / S3", zap.String("bucket", cfg.S3Bucket), zap.String("endpoint", cfg.S3Endpoint))
 	default:
-		storageBackend, err = storage.NewLocalBackend(
-			cfg.LocalStoragePath,
-			cfg.PublicBaseURL,
-		)
+		storageBackend, err = storage.NewLocalBackend(cfg.LocalStoragePath, cfg.PublicBaseURL)
 		if err != nil {
 			log.Fatal("local storage init failed", zap.Error(err))
 		}
 		log.Info("storage: local filesystem", zap.String("path", cfg.LocalStoragePath))
 	}
 
-	// ── Media services ──
 	prober := media.NewProber(cfg.FFprobePath)
 	analyzer := media.NewAnalyzer(prober)
 	processor := media.NewProcessor(cfg.FFmpegPath, cfg.TempDir)
 
-	// ── Business service ──
 	baseURL := cfg.PublicBaseURL
 	svc := service.NewMediaService(jobStore, variantStore, assetStore, eventStore, sourceStore, baseURL)
-
-	// ── Auth ──
 	tokenSvc := auth.NewTokenService(cfg.JWTSecret, cfg.JWTExpiry, cfg.JWTEnabled)
-
-	// ── HTTP handler ──
 	h := handler.New(svc, storageBackend, tokenSvc, log)
 
-	// ── Router ──
 	r := chi.NewRouter()
-
-	// Global middleware
 	r.Use(chiMiddleware.RealIP)
 	r.Use(mw.RequestID)
 	r.Use(mw.Logger(log))
@@ -147,31 +138,21 @@ func main() {
 		MaxAge:           300,
 	}))
 
-	// Health probes (unauthenticated)
 	r.Get("/healthz", h.Healthz)
 	r.Get("/readyz", h.Readyz)
-
-	// Asset download (token-authenticated, no JWT needed)
 	r.Get("/v1/assets/dl/{token}", h.DownloadByToken)
 
-	// API v1 – optionally JWT-protected
 	r.Group(func(r chi.Router) {
 		r.Use(tokenSvc.Middleware)
-
-		// Rate-limit job creation: 20 req/min per IP
 		r.With(httprate.LimitByIP(20, time.Minute)).Post("/v1/analyze", h.Analyze)
-
 		r.Get("/v1/jobs/{id}", h.GetJob)
 		r.Get("/v1/jobs/{id}/variants", h.GetVariants)
-
 		r.Post("/v1/jobs/{id}/actions/extract-audio", h.ExtractAudio)
 		r.Post("/v1/jobs/{id}/actions/merge", h.Merge)
 		r.Post("/v1/jobs/{id}/actions/transcode", h.Transcode)
-
 		r.Get("/v1/assets/{id}", h.GetAsset)
 	})
 
-	// ── Worker pool ──
 	workerCtx, workerCancel := context.WithCancel(ctx)
 	pool_ := jobs.NewPool(cfg.WorkerCount, cfg.PollInterval, jobs.WorkerConfig{
 		Jobs:      jobStore,
@@ -189,7 +170,6 @@ func main() {
 	}, log)
 	go pool_.Start(workerCtx)
 
-	// ── Asset cleanup ticker ──
 	go func() {
 		t := time.NewTicker(1 * time.Hour)
 		defer t.Stop()
@@ -203,7 +183,6 @@ func main() {
 		}
 	}()
 
-	// ── HTTP server ──
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,
 		Handler:      r,
@@ -219,7 +198,6 @@ func main() {
 		}
 	}()
 
-	// ── Graceful shutdown ──
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
